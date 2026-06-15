@@ -1,1 +1,18 @@
-PLAN.md
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Vault files generated at runtime (gitkeep preserves the directory)
+vault_samples/insecure_vault.json
+vault_samples/secure_vault.json
+
+# macOS
+.DS_Store
+
+# Docs
+docs/
