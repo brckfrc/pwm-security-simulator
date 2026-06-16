@@ -26,9 +26,12 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
-from kdf import derive_pbkdf2
+from kdf import derive_pbkdf2, derive_argon2id
 
 KDF_ITERATIONS_DEFAULT = 600_000
+ARGON2_TIME_COST_DEFAULT = 3
+ARGON2_MEMORY_COST_DEFAULT = 65536  # 64 MiB
+ARGON2_PARALLELISM_DEFAULT = 1
 
 
 class IntegrityError(Exception):
@@ -70,18 +73,73 @@ def _aad_for_vault(meta: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# KDF selection helpers
+# ---------------------------------------------------------------------------
+
+def _build_kdf_meta(kdf_type: str, salt: bytes) -> dict:
+    """
+    Build the stored ``kdf`` metadata block for a freshly created vault.
+
+    The two supported KDFs mirror the real-world Bitwarden/Vaultwarden choice:
+    PBKDF2 (iteration-based) and Argon2id (memory-hard).
+    """
+    if kdf_type == "pbkdf2":
+        return {
+            "type": "pbkdf2",
+            "salt": _b64(salt),
+            "iterations": KDF_ITERATIONS_DEFAULT,
+        }
+    if kdf_type == "argon2id":
+        return {
+            "type": "argon2id",
+            "salt": _b64(salt),
+            "time_cost": ARGON2_TIME_COST_DEFAULT,
+            "memory_cost": ARGON2_MEMORY_COST_DEFAULT,
+            "parallelism": ARGON2_PARALLELISM_DEFAULT,
+        }
+    raise ValueError(f"Unknown KDF type: {kdf_type!r}")
+
+
+def _derive_key_from_meta(kdf_meta: dict, password: str) -> bytes:
+    """
+    Derive the 256-bit encryption key from a stored ``kdf`` metadata block.
+
+    The KDF type and parameters come straight from the vault file, so an
+    attacker who tampers with them changes the derived key (insecure mode) or
+    invalidates the GCM tag because they are bound via AAD (secure mode).
+    """
+    salt = _unb64(kdf_meta["salt"])
+    if kdf_meta["type"] == "pbkdf2":
+        return derive_pbkdf2(password, salt, kdf_meta["iterations"])
+    if kdf_meta["type"] == "argon2id":
+        return derive_argon2id(
+            password,
+            salt,
+            time_cost=kdf_meta["time_cost"],
+            memory_cost=kdf_meta["memory_cost"],
+            parallelism=kdf_meta["parallelism"],
+        )
+    raise ValueError(f"Unknown KDF type: {kdf_meta['type']!r}")
+
+
+# ---------------------------------------------------------------------------
 # Insecure vault  (AES-CTR, no MAC)
 # ---------------------------------------------------------------------------
 
-def encrypt_insecure(plaintext_dict: dict, password: str, path: str | Path) -> dict:
+def encrypt_insecure(
+    plaintext_dict: dict, password: str, path: str | Path, kdf_type: str = "pbkdf2"
+) -> dict:
     """
     Encrypt *plaintext_dict* with AES-CTR.
 
     No integrity mechanism is applied. The KDF parameters are stored in
     plaintext and are NOT cryptographically bound to the ciphertext.
+
+    *kdf_type* selects the key derivation function ("pbkdf2" or "argon2id").
     """
     salt = os.urandom(16)
-    key = derive_pbkdf2(password, salt, KDF_ITERATIONS_DEFAULT)
+    kdf_meta = _build_kdf_meta(kdf_type, salt)
+    key = _derive_key_from_meta(kdf_meta, password)
     iv = os.urandom(16)  # AES block size = 16 bytes; used as CTR nonce+counter
 
     plaintext = json.dumps(plaintext_dict).encode()
@@ -92,11 +150,7 @@ def encrypt_insecure(plaintext_dict: dict, password: str, path: str | Path) -> d
     vault: dict[str, Any] = {
         "mode": "insecure-aes-ctr",
         "version": 1,
-        "kdf": {
-            "type": "pbkdf2",
-            "salt": _b64(salt),
-            "iterations": KDF_ITERATIONS_DEFAULT,
-        },
+        "kdf": kdf_meta,
         "iv": _b64(iv),
         "ciphertext": _b64(ciphertext),
     }
@@ -116,9 +170,7 @@ def decrypt_insecure(password: str, path: str | Path) -> dict:
     check in this mode.
     """
     vault = json.loads(Path(path).read_text())
-    salt = _unb64(vault["kdf"]["salt"])
-    iterations = vault["kdf"]["iterations"]
-    key = derive_pbkdf2(password, salt, iterations)
+    key = _derive_key_from_meta(vault["kdf"], password)
     iv = _unb64(vault["iv"])
     ciphertext = _unb64(vault["ciphertext"])
 
@@ -137,26 +189,32 @@ def decrypt_insecure(password: str, path: str | Path) -> dict:
 # Secure vault  (AES-GCM / AEAD)
 # ---------------------------------------------------------------------------
 
-def encrypt_secure(plaintext_dict: dict, password: str, path: str | Path, version: int = 1) -> dict:
+def encrypt_secure(
+    plaintext_dict: dict,
+    password: str,
+    path: str | Path,
+    version: int = 1,
+    kdf_type: str = "pbkdf2",
+) -> dict:
     """
     Encrypt *plaintext_dict* with AES-GCM.
 
     The vault version and KDF parameters are passed as associated data (AAD)
     so that they are authenticated alongside the ciphertext.  Any modification
     to these fields will cause decryption to fail.
+
+    *kdf_type* selects the key derivation function ("pbkdf2" or "argon2id").
+    Whichever is chosen, its full parameter set is bound via AAD.
     """
     salt = os.urandom(16)
-    key = derive_pbkdf2(password, salt, KDF_ITERATIONS_DEFAULT)
+    kdf_meta = _build_kdf_meta(kdf_type, salt)
+    key = _derive_key_from_meta(kdf_meta, password)
     nonce = os.urandom(12)  # 96-bit nonce recommended for AES-GCM
 
     meta: dict[str, Any] = {
         "mode": "secure-aes-gcm",
         "version": version,
-        "kdf": {
-            "type": "pbkdf2",
-            "salt": _b64(salt),
-            "iterations": KDF_ITERATIONS_DEFAULT,
-        },
+        "kdf": kdf_meta,
         "nonce": _b64(nonce),
     }
 
@@ -178,9 +236,7 @@ def decrypt_secure(password: str, path: str | Path) -> dict:
     any KDF/version metadata field) has been modified.
     """
     vault = json.loads(Path(path).read_text())
-    salt = _unb64(vault["kdf"]["salt"])
-    iterations = vault["kdf"]["iterations"]
-    key = derive_pbkdf2(password, salt, iterations)
+    key = _derive_key_from_meta(vault["kdf"], password)
     nonce = _unb64(vault["nonce"])
     ct_with_tag = _unb64(vault["ciphertext"])
 
@@ -198,16 +254,17 @@ def decrypt_secure(password: str, path: str | Path) -> dict:
 # Tamper helpers
 # ---------------------------------------------------------------------------
 
-def tamper_bitflip(path: str | Path, byte_offset: int = 8) -> str:
+def tamper_bitflip(path: str | Path, byte_offset: int = 8, mask: int = 0xFF) -> str:
     """
-    Flip a single bit in the ciphertext.
+    Flip bits in a single ciphertext byte by XOR-ing it with *mask*.
 
     In insecure (AES-CTR) mode: because CTR mode is stream-cipher-like,
-    flipping bit N in the ciphertext flips the same bit in the plaintext —
-    allowing predictable, targeted plaintext modification without the key.
+    XOR-ing ciphertext byte N with a mask applies the *same* XOR to plaintext
+    byte N — allowing predictable, targeted plaintext modification without the
+    key. (mask=0x20 on an ASCII letter toggles its case, for example.)
 
-    In secure (AES-GCM) mode: this invalidates the GCM authentication tag,
-    so decryption will raise IntegrityError.
+    In secure (AES-GCM) mode: any change invalidates the GCM authentication
+    tag, so decryption raises IntegrityError.
 
     Returns a description of the modification made.
     """
@@ -215,32 +272,62 @@ def tamper_bitflip(path: str | Path, byte_offset: int = 8) -> str:
     raw = bytearray(_unb64(vault["ciphertext"]))
     idx = byte_offset % len(raw)
     original = raw[idx]
-    raw[idx] ^= 0xFF  # flip all bits in that byte
+    raw[idx] ^= mask
     vault["ciphertext"] = _b64(bytes(raw))
     Path(path).write_text(json.dumps(vault, indent=2))
-    return f"Flipped byte {idx}: 0x{original:02x} → 0x{raw[idx]:02x}"
+    return f"Flipped byte {idx} (mask 0x{mask:02x}): 0x{original:02x} → 0x{raw[idx]:02x}"
 
 
-def tamper_downgrade_kdf(path: str | Path, low_iterations: int = 1_000) -> str:
+def field_value_letter_offset(plaintext_dict: dict, field: str) -> int:
     """
-    Lower the stored KDF iteration count.
+    Byte offset, within ``json.dumps(plaintext_dict)``, of the first ASCII
+    letter in *field*'s value.
 
-    In insecure mode: the iteration count is used as-is during decryption,
-    which weakens the key derivation and makes the vault vulnerable to
-    brute-force attacks. The vault still decrypts "successfully" — but with a
-    different (wrong) key, producing garbage (or raising a JSON parse error).
-    The system does not alert the user that parameters were tampered.
+    Used by the targeted bit-flip demo: knowing this offset lets us flip the
+    matching ciphertext byte and produce a *predictable* change to that exact
+    character (e.g. case-toggling the first letter of the password) — proving
+    AES-CTR malleability rather than just garbling random bytes.
+    """
+    blob = json.dumps(plaintext_dict).encode()
+    value = plaintext_dict[field]
+    value_token = json.dumps(value).encode()  # quoted string, e.g. "SuperSecret!42"
+    start = blob.index(value_token) + 1  # +1 skips the opening quote -> first char
+    for i, ch in enumerate(str(value)):
+        if ch.isascii() and ch.isalpha():
+            return start + i
+    return start  # no letter found; fall back to the first character
 
-    In secure mode: the KDF parameters are bound via AAD, so the GCM tag
-    will not match and decryption raises IntegrityError.
+
+def tamper_downgrade_kdf(
+    path: str | Path, low_iterations: int = 1_000, low_memory_cost: int = 8
+) -> str:
+    """
+    Lower the stored KDF cost parameter (PBKDF2 iterations or Argon2id memory).
+
+    In insecure mode: the parameter is used as-is during decryption. Lowering it
+    derives a *different* (wrong) key, so the vault decrypts to garbage. The
+    point is not that the existing vault becomes easier to crack — it is that
+    the parameter change is accepted with no integrity signal at all. (The real
+    downgrade threat happens at enrollment/re-encryption time, when a malicious
+    server convinces the client to derive its key with weak parameters.)
+
+    In secure mode: the KDF parameters are bound via AAD, so the GCM tag will
+    not match and decryption raises IntegrityError.
 
     Returns a description of the modification made.
     """
     vault = json.loads(Path(path).read_text())
-    original = vault["kdf"]["iterations"]
-    vault["kdf"]["iterations"] = low_iterations
+    kdf = vault["kdf"]
+    if kdf["type"] == "pbkdf2":
+        original = kdf["iterations"]
+        kdf["iterations"] = low_iterations
+        desc = f"PBKDF2 iterations: {original:,} → {low_iterations:,}"
+    else:  # argon2id
+        original = kdf["memory_cost"]
+        kdf["memory_cost"] = low_memory_cost
+        desc = f"Argon2id memory_cost: {original} → {low_memory_cost} KiB"
     Path(path).write_text(json.dumps(vault, indent=2))
-    return f"KDF iterations: {original:,} → {low_iterations:,}"
+    return desc
 
 
 def tamper_version_field(path: str | Path, new_version: int = 1) -> str:

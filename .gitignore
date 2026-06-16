@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
 # Vault files generated at runtime (gitkeep preserves the directory)
 vault_samples/insecure_vault.json
@@ -13,6 +14,3 @@ vault_samples/secure_vault.json
 
 # macOS
 .DS_Store
-
-# Docs
-docs/

@@ -45,8 +45,10 @@ The app opens in your browser at `http://localhost:8501`.
 ├── vault.py                Insecure (AES-CTR) and secure (AES-GCM) vault logic
 ├── requirements.txt        Pinned dependencies
 ├── README.md               This file
-├── PLAN.md                 Project design document
-├── rapor.md                One-page Turkish report
+├── docs/
+│   ├── PLAN.md             Project design document
+│   └── rapor.md            One-page Turkish report
+├── tests/                  pytest suite (round-trips + tamper detection)
 ├── vault_samples/          Vault files generated at runtime
 │   ├── insecure_vault.json
 │   └── secure_vault.json
