@@ -1,6 +1,6 @@
 cryptography==50.0.2
 argon2-cffi==25.1.0
-streamlit==1.66.0
+streamlit==1.66.1
 
 # Testing
 pytest==9.1.1
