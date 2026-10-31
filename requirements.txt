@@ -3,4 +3,4 @@ argon2-cffi==25.1.0
 streamlit==1.66.1
 
 # Testing
-pytest==9.1.1
+pytest==9.2.0
